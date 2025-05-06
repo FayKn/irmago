@@ -36,11 +36,6 @@ func (kss *keyshareServer) registerPublicKey(client *Client, transport *irma.HTT
 	if result.Status == kssPinSuccess {
 		// We leave dealing with any other case up to the calling code
 		kss.ChallengeResponse = true
-		err = client.storage.StoreKeyshareServers(client.keyshareServers)
-		if err != nil {
-			err = irma.WrapErrorPrefix(err, "failed to store updated keyshare server")
-			return nil, err
-		}
 	}
 
 	return result, nil

@@ -210,7 +210,10 @@ func TestKeyshareEnrollIncorrectPin(t *testing.T) {
 	test2SchemeID := irma.NewSchemeManagerIdentifier("test2")
 	client.KeyshareEnroll(test2SchemeID, nil, "54321", "en")
 	require.ErrorContains(t, <-handler.c, "incorrect pin")
-	require.NotContains(t, client.EnrolledSchemeManagers(), test2SchemeID)
+
+	enrolledManagers, err := client.EnrolledSchemeManagers()
+	require.NoError(t, err)
+	require.NotContains(t, enrolledManagers, test2SchemeID)
 }
 
 func TestKeyshareChainedSessions(t *testing.T) {

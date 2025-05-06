@@ -16,7 +16,6 @@ import (
 	"github.com/privacybydesign/gabi/revocation"
 	irma "github.com/privacybydesign/irmago"
 	"github.com/privacybydesign/irmago/internal/common"
-	"github.com/privacybydesign/irmago/internal/concmap"
 )
 
 // This file contains most methods of the Client (c.f. session.go
@@ -44,16 +43,6 @@ import (
 // in multiple places would be bad).
 
 type Client struct {
-	// Stuff we manage on disk
-	secretkey        *secretKey
-	attributes       map[irma.CredentialTypeIdentifier][]*irma.AttributeList
-	credentialsCache concmap.ConcMap[credLookup, *credential]
-	keyshareServers  map[irma.SchemeManagerIdentifier]*keyshareServer
-	updates          []update
-
-	lookup map[string]*credLookup
-
-	// Where we store/load it to/from
 	storage storage
 
 	// Versions the client supports
@@ -161,8 +150,6 @@ func New(
 	}
 
 	client := &Client{
-		keyshareServers:       make(map[irma.SchemeManagerIdentifier]*keyshareServer),
-		attributes:            make(map[irma.CredentialTypeIdentifier][]*irma.AttributeList),
 		irmaConfigurationPath: irmaConfigurationPath,
 		handler:               handler,
 		signer:                signer,
@@ -203,11 +190,6 @@ func New(
 	}
 	client.applyPreferences()
 
-	err = client.loadCredentialStorage()
-	if err != nil {
-		return nil, err
-	}
-
 	client.sessions = sessions{client: client, sessions: map[string]*session{}}
 
 	gocron.SetPanicHandler(func(jobName string, recoverData interface{}) {
@@ -222,7 +204,10 @@ func New(
 	})
 
 	client.jobs = make(chan func(), 100)
-	client.initRevocation()
+	err = client.initRevocation()
+	if err != nil {
+		return nil, err
+	}
 	client.StartJobs()
 
 	return client, schemeMgrErr
@@ -232,27 +217,6 @@ func (client *Client) Close() error {
 	client.PauseJobs()
 	client.Configuration.Scheduler.Stop()
 	return client.storage.Close()
-}
-
-func (client *Client) loadCredentialStorage() (err error) {
-	if client.secretkey, err = client.storage.LoadSecretKey(); err != nil {
-		return
-	}
-	if client.attributes, err = client.storage.LoadAttributes(); err != nil {
-		return
-	}
-	if client.keyshareServers, err = client.storage.LoadKeyshareServers(); err != nil {
-		return
-	}
-
-	client.lookup = map[string]*credLookup{}
-	for _, attrlistlist := range client.attributes {
-		for i, attrlist := range attrlistlist {
-			client.lookup[attrlist.Hash()] = &credLookup{id: attrlist.CredentialType().Identifier(), counter: i}
-		}
-	}
-	client.credentialsCache = concmap.New[credLookup, *credential]()
-	return
 }
 
 func (client *Client) reportError(err error) {
@@ -300,9 +264,15 @@ func (client *Client) PauseJobs() {
 
 // CredentialInfoList returns a list of information of all contained credentials.
 func (client *Client) CredentialInfoList() irma.CredentialInfoList {
+	attributes, err := client.storage.LoadAttributes()
+	if err != nil {
+		irma.Logger.Infof("failed to load attributes: %v", err)
+		return irma.CredentialInfoList{}
+	}
+
 	list := irma.CredentialInfoList([]*irma.CredentialInfo{})
 
-	for _, attrlistlist := range client.attributes {
+	for _, attrlistlist := range attributes {
 		for _, attrlist := range attrlistlist {
 			info := attrlist.Info()
 			if info == nil {
@@ -323,11 +293,16 @@ func (client *Client) addCredential(cred *credential) (err error) {
 		id = cred.CredentialType().Identifier()
 	}
 
+	attributes, err := client.storage.LoadAttributes()
+	if err != nil {
+		return err
+	}
+
 	// If we receive a duplicate credential it should overwrite the previous one; remove it first
 	// (it makes no sense to possess duplicate credentials, but the new signature might contain new
 	// functionality such as a nonrevocation witness, so it does not suffice to just return here)
 	index := -1
-	for _, attrlistlist := range client.attributes {
+	for _, attrlistlist := range attributes {
 		for i, attrs := range attrlistlist {
 			if attrs.Hash() == cred.attrs.Hash() {
 				index = i
@@ -362,19 +337,13 @@ func (client *Client) addCredential(cred *credential) (err error) {
 	}
 
 	// Append the new cred to our attributes and credentials
-	client.attributes[id] = append(client.attrs(id), cred.attrs)
-	if !id.Empty() {
-		counter := len(client.attributes[id]) - 1
-		credlookup := credLookup{id: id, counter: counter}
-		client.credentialsCache.Set(credlookup, cred)
-		client.lookup[cred.attrs.Hash()] = &credlookup
-	}
+	attributes[id] = append(client.attrs(id), cred.attrs)
 
 	return client.storage.Transaction(func(tx *transaction) error {
 		if err = client.storage.TxStoreSignature(tx, cred); err != nil {
 			return err
 		}
-		return client.storage.TxStoreAttributes(tx, id, client.attributes[id])
+		return client.storage.TxStoreAttributes(tx, id, attributes[id])
 	})
 }
 
@@ -389,22 +358,26 @@ func generateSecretKey() (*secretKey, error) {
 // Removal methods
 
 func (client *Client) remove(id irma.CredentialTypeIdentifier, index int, storeLog bool) error {
+	attributes, err := client.storage.LoadAttributes()
+	if err != nil {
+		return err
+	}
 	// Remove attributes
-	list, exists := client.attributes[id]
+	list, exists := attributes[id]
 	if !exists || index >= len(list) {
 		return errors.Errorf("Can't remove credential %s-%d: no such credential", id.String(), index)
 	}
 	attrs := list[index]
-	client.attributes[id] = append(list[:index], list[index+1:]...)
+	attributes[id] = append(list[:index], list[index+1:]...)
 
 	removed := map[irma.CredentialTypeIdentifier][]irma.TranslatedString{}
 	removed[id] = attrs.Strings()
 
-	err := client.storage.Transaction(func(tx *transaction) error {
+	err = client.storage.Transaction(func(tx *transaction) error {
 		if err := client.storage.TxDeleteSignature(tx, attrs.Hash()); err != nil {
 			return err
 		}
-		if err := client.storage.TxStoreAttributes(tx, id, client.attributes[id]); err != nil {
+		if err := client.storage.TxStoreAttributes(tx, id, attributes[id]); err != nil {
 			return err
 		}
 		if storeLog {
@@ -416,17 +389,7 @@ func (client *Client) remove(id irma.CredentialTypeIdentifier, index int, storeL
 		}
 		return nil
 	})
-	if err != nil {
-		return err
-	}
-
-	// Remove credential from cache
-	client.credentialsCache.Delete(credLookup{id: id, counter: index})
-	delete(client.lookup, attrs.Hash())
-	for i, attrs := range client.attributes[id] {
-		client.lookup[attrs.Hash()].counter = i
-	}
-	return nil
+	return err
 }
 
 // RemoveCredential removes the specified credential if that is allowed.
@@ -452,18 +415,12 @@ func (client *Client) RemoveCredentialByHash(hash string) error {
 func (client *Client) RemoveStorage() error {
 	var err error
 
-	// Remove data from memory
-	client.attributes = make(map[irma.CredentialTypeIdentifier][]*irma.AttributeList)
-	client.keyshareServers = make(map[irma.SchemeManagerIdentifier]*keyshareServer)
-	client.credentialsCache = concmap.New[credLookup, *credential]()
-	client.lookup = make(map[string]*credLookup)
-
 	if err = client.storage.DeleteAll(); err != nil {
 		return err
 	}
 
 	// Client assumes there is always a secret key, so we have to load a new one
-	client.secretkey, err = client.storage.LoadSecretKey()
+	_, err = client.storage.LoadSecretKey()
 	if err != nil {
 		return err
 	}
@@ -481,10 +438,11 @@ func (client *Client) RemoveStorage() error {
 
 // attrs returns cm.attributes[id], initializing it to an empty slice if necessary
 func (client *Client) attrs(id irma.CredentialTypeIdentifier) []*irma.AttributeList {
-	list, exists := client.attributes[id]
+	attrs, _ := client.storage.LoadAttributes()
+	list, exists := attrs[id]
+
 	if !exists {
 		list = make([]*irma.AttributeList, 0, 1)
-		client.attributes[id] = list
 	}
 	return list
 }
@@ -492,6 +450,7 @@ func (client *Client) attrs(id irma.CredentialTypeIdentifier) []*irma.AttributeL
 // Attributes returns the attribute list of the requested credential, or nil if we do not have it.
 func (client *Client) Attributes(id irma.CredentialTypeIdentifier, counter int) (attributes *irma.AttributeList) {
 	list := client.attrs(id)
+
 	if len(list) <= counter {
 		return
 	}
@@ -499,11 +458,22 @@ func (client *Client) Attributes(id irma.CredentialTypeIdentifier, counter int) 
 }
 
 func (client *Client) attributesByHash(hash string) (*irma.AttributeList, int) {
-	lookup, present := client.lookup[hash]
+	attributes, err := client.storage.LoadAttributes()
+	if err != nil {
+		return nil, 0
+	}
+	lookupMap := map[string]*credLookup{}
+	for _, attrlistlist := range attributes {
+		for i, attrlist := range attrlistlist {
+			lookupMap[attrlist.Hash()] = &credLookup{id: attrlist.CredentialType().Identifier(), counter: i}
+		}
+	}
+
+	lookup, present := lookupMap[hash]
 	if !present {
 		return nil, 0
 	}
-	return client.attributes[lookup.id][lookup.counter], lookup.counter
+	return attributes[lookup.id][lookup.counter], lookup.counter
 }
 
 func (client *Client) credentialByHash(hash string) (*credential, int, error) {
@@ -524,14 +494,6 @@ func (client *Client) credentialByID(id irma.CredentialIdentifier) (*credential,
 // FIXME: this function can cause concurrent map writes panics when invoked concurrently simultaneously,
 // in client.Configuration.publicKeys and client.credentialsCache.
 func (client *Client) credential(id irma.CredentialTypeIdentifier, counter int) (cred *credential, err error) {
-	// If the requested credential is not in credential map, we check if its attributes were
-	// deserialized during New(). If so, there should be a corresponding signature file,
-	// so we read that, construct the credential, and add it to the credential map
-	cred = client.credentialsCache.Get(credLookup{id, counter})
-	if cred != nil {
-		return
-	}
-
 	attrs := client.Attributes(id, counter)
 	if attrs == nil { // We do not have the requested cred
 		return
@@ -552,8 +514,14 @@ func (client *Client) credential(id irma.CredentialTypeIdentifier, counter int) 
 	if pk == nil {
 		return nil, errors.New("unknown public key")
 	}
+
+	secretKey, err := client.storage.LoadSecretKey()
+	if err != nil {
+		return nil, err
+	}
+
 	cred, err = newCredential(&gabi.Credential{
-		Attributes:           append([]*big.Int{client.secretkey.Key}, attrs.Ints...),
+		Attributes:           append([]*big.Int{secretKey.Key}, attrs.Ints...),
 		Signature:            sig,
 		NonRevocationWitness: witness,
 		Pk:                   pk,
@@ -561,7 +529,6 @@ func (client *Client) credential(id irma.CredentialTypeIdentifier, counter int) 
 	if err != nil {
 		return nil, err
 	}
-	client.credentialsCache.Set(credLookup{id, counter}, cred)
 	return cred, nil
 }
 
@@ -575,8 +542,12 @@ func (client *Client) credCandidates(request irma.SessionRequest, con irma.Attri
 	var candidates [][]*credCandidate
 	satisfiable := true
 
+	attributes, err := client.storage.LoadAttributes()
+	if err != nil {
+		return credCandidateSet{}, false, err
+	}
 	for _, credTypeID := range con.CredentialTypes() {
-		attrlistlist := client.attributes[credTypeID]
+		attrlistlist := attributes[credTypeID]
 		var c []*credCandidate
 		haveUsableCred := false
 		for _, attrlist := range attrlistlist {
@@ -676,6 +647,7 @@ func (client *Client) satisfiesCon(request irma.SessionRequest, attrs *irma.Attr
 		return false, false
 	}
 	cred, _, _ := client.credentialByHash(attrs.Hash())
+
 	usable := !attrs.Revoked && (!request.Base().RequestsRevocation(credtype) || cred.NonRevocationWitness != nil)
 
 	skipExpiryCheck := slices.Contains(request.Disclosure().SkipExpiryCheck, attrs.CredentialType().Identifier())
@@ -957,6 +929,11 @@ func (client *Client) IssuanceProofBuilders(
 		}
 	}
 
+	secretKey, err := client.storage.LoadSecretKey()
+	if err != nil {
+		return gabi.ProofBuilderList{}, irma.DisclosedAttributeIndices{}, nil, err
+	}
+
 	for _, futurecred := range request.Credentials {
 		var pk *gabikeys.PublicKey
 		keyID := futurecred.PublicKeyIdentifier()
@@ -977,7 +954,7 @@ func (client *Client) IssuanceProofBuilders(
 		}
 		credtype := client.Configuration.CredentialTypes[futurecred.CredentialTypeID]
 		credBuilder, err := gabi.NewCredentialBuilder(pk, request.GetContext(),
-			client.secretkey.Key, issuerProofNonce, keyshareP, credtype.RandomBlindAttributeIndices())
+			secretKey.Key, issuerProofNonce, keyshareP, credtype.RandomBlindAttributeIndices())
 		if err != nil {
 			return nil, nil, nil, err
 		}
@@ -1076,21 +1053,26 @@ func (client *Client) ConstructCredentials(msg []*gabi.IssueSignatureMessage, re
 
 // Keyshare server handling
 
-func (client *Client) genSchemeManagersList(enrolled bool) []irma.SchemeManagerIdentifier {
+func (client *Client) genSchemeManagersList(enrolled bool) ([]irma.SchemeManagerIdentifier, error) {
+	keyshareServers, err := client.storage.LoadKeyshareServers()
+	if err != nil {
+		return []irma.SchemeManagerIdentifier{}, err
+	}
+
 	list := []irma.SchemeManagerIdentifier{}
 	for name, manager := range client.Configuration.SchemeManagers {
-		if _, contains := client.keyshareServers[name]; manager.Distributed() && contains == enrolled {
+		if _, contains := keyshareServers[name]; manager.Distributed() && contains == enrolled {
 			list = append(list, manager.Identifier())
 		}
 	}
-	return list
+	return list, nil
 }
 
-func (client *Client) UnenrolledSchemeManagers() []irma.SchemeManagerIdentifier {
+func (client *Client) UnenrolledSchemeManagers() ([]irma.SchemeManagerIdentifier, error) {
 	return client.genSchemeManagersList(false)
 }
 
-func (client *Client) EnrolledSchemeManagers() []irma.SchemeManagerIdentifier {
+func (client *Client) EnrolledSchemeManagers() ([]irma.SchemeManagerIdentifier, error) {
 	return client.genSchemeManagersList(true)
 }
 
@@ -1116,11 +1098,15 @@ func (client *Client) keyshareEnrollWorker(managerID irma.SchemeManagerIdentifie
 		return errors.New("PIN too short, must be at least 5 characters")
 	}
 
+	keyshareServers, err := client.storage.LoadKeyshareServers()
+	if err != nil {
+		return err
+	}
+
 	// We expect that the PIN is equal across all keyshare servers. Therefore, we verify the PIN at one other
 	// keyshare server. We don't check all servers to prevent issues when custom keyshare servers are not available.
-	var err error
 	pinCorrect := true
-	for kssManagerID, kss := range client.keyshareServers {
+	for kssManagerID, kss := range keyshareServers {
 		if kss.PinOutOfSync {
 			continue
 		}
@@ -1171,7 +1157,7 @@ func (client *Client) keyshareEnrollWorker(managerID irma.SchemeManagerIdentifie
 	// keyshare.go needs the relevant keyshare server to be present in the client.
 	// If the session succeeds or fails, the keyshare server is stored to disk or
 	// removed from the client by the keyshareEnrollmentHandler.
-	client.keyshareServers[managerID] = kss
+	keyshareServers[managerID] = kss
 	handler := &backgroundIssuanceHandler{
 		pin: pin,
 		credentialsToBeIssuedCallback: func(creds []*irma.CredentialRequest) {
@@ -1191,7 +1177,7 @@ func (client *Client) keyshareEnrollWorker(managerID irma.SchemeManagerIdentifie
 			client.handler.EnrollmentFailure(managerID, irma.WrapErrorPrefix(err, "keyshare attribute issuance"))
 			return
 		}
-		err = client.storage.StoreKeyshareServers(client.keyshareServers)
+		err = client.storage.StoreKeyshareServers(keyshareServers)
 		if err != nil {
 			client.handler.EnrollmentFailure(managerID, err)
 			return
@@ -1219,7 +1205,11 @@ func (client *Client) KeyshareVerifyPin(pin string, schemeid irma.SchemeManagerI
 			Info:      schemeid.String(),
 		}
 	}
-	kss := client.keyshareServers[schemeid]
+	keyshareServers, err := client.storage.LoadKeyshareServers()
+	if err != nil {
+		return false, 0, 0, err
+	}
+	kss := keyshareServers[schemeid]
 	transport := irma.NewHTTPTransport(scheme.KeyshareServer, !client.Preferences.DeveloperMode)
 	success, tries, blocked, err := client.verifyPinWorker(pin, kss, transport)
 	if err == nil && success {
@@ -1228,10 +1218,14 @@ func (client *Client) KeyshareVerifyPin(pin string, schemeid irma.SchemeManagerI
 	return success, tries, blocked, err
 }
 
-func (client *Client) KeyshareChangePin(oldPin string, newPin string) {
+func (client *Client) KeyshareChangePin(oldPin string, newPin string) error {
+	keyshareServers, err := client.storage.LoadKeyshareServers()
+	if err != nil {
+		return err
+	}
 	go func() {
 		// Check whether all keyshare servers are available.
-		for schemeID, kss := range client.keyshareServers {
+		for schemeID, kss := range keyshareServers {
 			if kss.PinOutOfSync {
 				continue
 			}
@@ -1253,7 +1247,7 @@ func (client *Client) KeyshareChangePin(oldPin string, newPin string) {
 		// Change the PIN across all keyshare servers.
 		var updatedSchemes []irma.SchemeManagerIdentifier
 		var err error
-		for schemeID, kss := range client.keyshareServers {
+		for schemeID, kss := range keyshareServers {
 			if kss.PinOutOfSync {
 				continue
 			}
@@ -1275,12 +1269,12 @@ func (client *Client) KeyshareChangePin(oldPin string, newPin string) {
 				err = client.keyshareChangePinWorker(updatedManager, newPin, oldPin)
 				if err != nil {
 					client.reportError(err)
-					client.keyshareServers[updatedManager].PinOutOfSync = true
+					keyshareServers[updatedManager].PinOutOfSync = true
 					pinOutOfSync = true
 				}
 			}
 			if pinOutOfSync {
-				err = client.storage.StoreKeyshareServers(client.keyshareServers)
+				err = client.storage.StoreKeyshareServers(keyshareServers)
 				if err != nil {
 					client.reportError(err)
 				}
@@ -1290,10 +1284,15 @@ func (client *Client) KeyshareChangePin(oldPin string, newPin string) {
 
 		client.handler.ChangePinSuccess()
 	}()
+	return nil
 }
 
 func (client *Client) keyshareChangePinWorker(managerID irma.SchemeManagerIdentifier, oldPin string, newPin string) error {
-	kss, ok := client.keyshareServers[managerID]
+	keyshareServers, err := client.storage.LoadKeyshareServers()
+	if err != nil {
+		return err
+	}
+	kss, ok := keyshareServers[managerID]
 	if !ok {
 		return errors.New("Unknown keyshare server")
 	}
@@ -1342,7 +1341,11 @@ func (client *Client) keyshareChangePinWorker(managerID irma.SchemeManagerIdenti
 
 // KeyshareRemove unenrolls the keyshare server of the specified scheme manager and removes all associated credentials.
 func (client *Client) KeyshareRemove(manager irma.SchemeManagerIdentifier) error {
-	if _, contains := client.keyshareServers[manager]; !contains {
+	keyshareServers, err := client.storage.LoadKeyshareServers()
+	if err != nil {
+		return err
+	}
+	if _, contains := keyshareServers[manager]; !contains {
 		return errors.New("can't uninstall unknown keyshare server")
 	}
 	return client.stripStorage([]irma.SchemeManagerIdentifier{manager}, false)
@@ -1350,8 +1353,12 @@ func (client *Client) KeyshareRemove(manager irma.SchemeManagerIdentifier) error
 
 // KeyshareRemoveAll removes all keyshare server registrations and associated credentials.
 func (client *Client) KeyshareRemoveAll() error {
+	keyshareServers, err := client.storage.LoadKeyshareServers()
+	if err != nil {
+		return err
+	}
 	var managers []irma.SchemeManagerIdentifier
-	for schemeID := range client.keyshareServers {
+	for schemeID := range keyshareServers {
 		managers = append(managers, schemeID)
 	}
 	return client.stripStorage(managers, false)
@@ -1362,22 +1369,16 @@ func (client *Client) stripStorage(schemeIDs []irma.SchemeManagerIdentifier, rem
 	client.credMutex.Lock()
 	defer client.credMutex.Unlock()
 
-	defer func() {
-		err := client.loadCredentialStorage()
-		if err != nil {
-			// Cached storage is out-of-sync with real storage, so we can't do anything but report the error and
-			// close the client to prevent unexpected changes.
-			client.reportError(err)
-			_ = client.Close()
-		}
-	}()
-
 	remainingSchemes := make(map[irma.SchemeManagerIdentifier]struct{})
+	keyshareServers, err := client.storage.LoadKeyshareServers()
+	if err != nil {
+		return err
+	}
 	for schemeID := range client.Configuration.SchemeManagers {
 		remainingSchemes[schemeID] = struct{}{}
 	}
 	for _, schemeID := range schemeIDs {
-		delete(client.keyshareServers, schemeID)
+		delete(keyshareServers, schemeID)
 		delete(remainingSchemes, schemeID)
 	}
 
@@ -1428,7 +1429,7 @@ func (client *Client) stripStorage(schemeIDs []irma.SchemeManagerIdentifier, rem
 			}
 		}
 
-		return client.storage.TxStoreKeyshareServers(tx, client.keyshareServers)
+		return client.storage.TxStoreKeyshareServers(tx, keyshareServers)
 	})
 }
 
@@ -1495,13 +1496,18 @@ func (client *Client) ConfigurationUpdated(downloaded *irma.IrmaIdentifierSet) e
 		return nil
 	}
 
+	attributes, err := client.storage.LoadAttributes()
+	if err != nil {
+		return err
+	}
+
 	var contains bool
 	for id := range downloaded.CredentialTypes {
-		if _, contains = client.attributes[id]; !contains {
+		if _, contains = attributes[id]; !contains {
 			continue
 		}
-		for i := range client.attributes[id] {
-			attrs := client.attributes[id][i].Ints
+		for i := range attributes[id] {
+			attrs := attributes[id][i].Ints
 			diff := len(client.Configuration.CredentialTypes[id].AttributeTypes) - (len(attrs) - 1)
 			if diff <= 0 {
 				continue
@@ -1510,16 +1516,10 @@ func (client *Client) ConfigurationUpdated(downloaded *irma.IrmaIdentifierSet) e
 			for j := len(attrs) - diff; j < len(attrs); j++ {
 				attrs[j] = big.NewInt(0)
 			}
-			client.attributes[id][i].Ints = attrs
-			if err := client.storage.StoreAttributes(id, client.attributes[id]); err != nil {
+			attributes[id][i].Ints = attrs
+			if err := client.storage.StoreAttributes(id, attributes[id]); err != nil {
 				return err
 			}
-
-			cred := client.credentialsCache.Get(credLookup{id, i})
-			if cred == nil {
-				return nil
-			}
-			cred.Attributes = append(cred.Attributes[:1], attrs...)
 		}
 	}
 

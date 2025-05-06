@@ -13,7 +13,6 @@ import (
 	"github.com/privacybydesign/gabi/signed"
 	irma "github.com/privacybydesign/irmago"
 	"github.com/privacybydesign/irmago/internal/common"
-	"github.com/privacybydesign/irmago/internal/concmap"
 	"github.com/privacybydesign/irmago/internal/test"
 	"github.com/sirupsen/logrus"
 
@@ -96,7 +95,12 @@ func verifyClientIsUnmarshaled(t *testing.T, client *Client) {
 
 func verifyCredentials(t *testing.T, client *Client) {
 	var pk *gabikeys.PublicKey
-	for credtype, credsmap := range client.attributes {
+	attributes, err := client.storage.LoadAttributes()
+	require.NoError(t, err)
+	secretKey, err := client.storage.LoadSecretKey()
+	require.NoError(t, err)
+
+	for credtype, credsmap := range attributes {
 		for index, attrs := range credsmap {
 			cred, err := client.credential(attrs.CredentialType().Identifier(), index)
 			require.NoError(t, err)
@@ -106,29 +110,12 @@ func verifyCredentials(t *testing.T, client *Client) {
 				cred.Credential.Signature.Verify(pk, cred.Attributes),
 				"Credential %s-%d was invalid", credtype.String(), index,
 			)
-			require.Equal(t, cred.Attributes[0], client.secretkey.Key,
+			require.Equal(t, cred.Attributes[0], secretKey.Key,
 				"Secret key of credential %s-%d unequal to main secret key",
 				cred.CredentialType().Identifier().String(), index,
 			)
 		}
 	}
-}
-
-func verifyKeyshareIsUnmarshaled(t *testing.T, client *Client) {
-	require.NotNil(t, client.keyshareServers)
-	testManager := irma.NewSchemeManagerIdentifier("test")
-	require.Contains(t, client.keyshareServers, testManager)
-	kss := client.keyshareServers[testManager]
-	require.NotEmpty(t, kss.Nonce)
-}
-
-func TestStorageDeserialization(t *testing.T) {
-	client, handler := parseStorage(t)
-	defer test.ClearTestStorage(t, client, handler.storage)
-
-	verifyClientIsUnmarshaled(t, client)
-	verifyCredentials(t, client)
-	verifyKeyshareIsUnmarshaled(t, client)
 }
 
 // TestCandidates tests the correctness of the function of the client that, given a disjunction of attributes
@@ -411,7 +398,9 @@ func TestKeyshareEnrollmentRemoval(t *testing.T) {
 	err = client.storage.Close()
 	require.NoError(t, err)
 
-	require.NotContains(t, client.keyshareServers, "test")
+	keyshareServers, err := client.storage.LoadKeyshareServers()
+	require.NoError(t, err)
+	require.NotContains(t, keyshareServers, "test")
 }
 
 func TestUpdatingStorage(t *testing.T) {
@@ -421,7 +410,9 @@ func TestUpdatingStorage(t *testing.T) {
 	require.NotNil(t, client)
 
 	// Check whether all update functions succeeded
-	for _, u := range client.updates {
+	updates, err := client.storage.LoadUpdates()
+	require.NoError(t, err)
+	for _, u := range updates {
 		require.Equal(t, true, u.Success)
 	}
 }
@@ -438,7 +429,8 @@ func TestRemoveStorage(t *testing.T) {
 	bucketsBefore := map[string]bool{"attrs": true, "sigs": true, "userdata": true, "logs": len(logs) > 0}
 	bucketsAfter := map[string]bool{"attrs": false, "sigs": false, "userdata": true, "logs": false} // Userdata should hold a new secret key
 
-	old_sk := *client.secretkey
+	old_sk, err := client.storage.LoadSecretKey()
+	require.NoError(t, err)
 
 	// Check that buckets exist
 	for name, exists := range bucketsBefore {
@@ -452,7 +444,9 @@ func TestRemoveStorage(t *testing.T) {
 	}
 
 	// Check that the client has a new secret key
-	new_sk := *client.secretkey
+
+	new_sk, err := client.storage.LoadSecretKey()
+	require.NoError(t, err)
 	require.NotEqual(t, old_sk, new_sk)
 }
 
@@ -462,9 +456,6 @@ func TestCredentialsConcurrency(t *testing.T) {
 	grp := sync.WaitGroup{}
 
 	for j := 0; j < 1000; j++ {
-		// Clear map for next iteration
-		client.credentialsCache = concmap.New[credLookup, *credential]()
-
 		for i := 0; i < 10; i++ {
 			grp.Add(1)
 			go func() {

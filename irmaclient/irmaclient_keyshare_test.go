@@ -33,11 +33,13 @@ func TestKeyshareChangePin(t *testing.T) {
 
 	// Test whether the authorization token is still valid after changing the PIN.
 	transport := irma.NewHTTPTransport(fmt.Sprintf("http://%s", ks1.Addr), false)
-	transport.SetHeader("X-IRMA-Keyshare-Username", client.keyshareServers[testSchemeID].Username)
-	transport.SetHeader("Authorization", client.keyshareServers[testSchemeID].token)
+	keyshareServers, err := client.storage.LoadKeyshareServers()
+	require.NoError(t, err)
+	transport.SetHeader("X-IRMA-Keyshare-Username", keyshareServers[testSchemeID].Username)
+	transport.SetHeader("Authorization", keyshareServers[testSchemeID].token)
 	reqBody := []string{"test.test-0"}
 	comms := &irma.ProofPCommitmentMap{}
-	err := transport.Post("prove/getCommitments", comms, reqBody)
+	err = transport.Post("prove/getCommitments", comms, reqBody)
 	require.NoError(t, err)
 
 	client.KeyshareChangePin("54321", "12345")
@@ -66,7 +68,10 @@ func TestKeyshareChangePinFailed(t *testing.T) {
 
 	client.KeyshareChangePin("12345", "54321")
 	require.Error(t, <-handler.c)
-	for _, kss := range client.keyshareServers {
+	keyshareServers, err := client.storage.LoadKeyshareServers()
+	require.NoError(t, err)
+
+	for _, kss := range keyshareServers {
 		require.False(t, kss.PinOutOfSync)
 	}
 
@@ -81,7 +86,9 @@ func TestKeyshareChallengeResponseUpgrade(t *testing.T) {
 	client, handler := parseStorage(t)
 	defer test.ClearTestStorage(t, client, handler.storage)
 
-	kss := client.keyshareServers[irma.NewSchemeManagerIdentifier("test")]
+	keyshareServers, err := client.storage.LoadKeyshareServers()
+	require.NoError(t, err)
+	kss := keyshareServers[irma.NewSchemeManagerIdentifier("test")]
 
 	// legacyuser is a copy of our user account at the keyshare server,
 	// but witout a public key registered to it
@@ -111,7 +118,9 @@ func TestKeyshareAuthentication(t *testing.T) {
 	client, handler := parseStorage(t)
 	defer test.ClearTestStorage(t, client, handler.storage)
 
-	kss := client.keyshareServers[irma.NewSchemeManagerIdentifier("test")]
+	keyshareServers, err := client.storage.LoadKeyshareServers()
+	require.NoError(t, err)
+	kss := keyshareServers[irma.NewSchemeManagerIdentifier("test")]
 
 	// This client has a public key registered at the keyshare server
 	require.True(t, kss.ChallengeResponse)

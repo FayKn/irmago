@@ -103,7 +103,7 @@ func newKeyshareSession(
 	session irma.SessionRequest,
 	implicitDisclosure [][]*irma.AttributeIdentifier,
 	protocolVersion *irma.ProtocolVersion,
-) (*keyshareSession, bool) {
+) (*keyshareSession, bool, error) {
 	ksscount := 0
 
 	// A number of times below we need to look at all involved schemes, and then we need to take into
@@ -116,20 +116,24 @@ func newKeyshareSession(
 		}
 	}
 
+	keyshareServers, err := client.storage.LoadKeyshareServers()
+	if err != nil {
+		return nil, false, err
+	}
 	for managerID := range schemeIDs {
 		if client.Configuration.SchemeManagers[managerID].Distributed() {
 			ksscount++
-			if _, enrolled := client.keyshareServers[managerID]; !enrolled {
+			if _, enrolled := keyshareServers[managerID]; !enrolled {
 				err := errors.New("Not enrolled to keyshare server of scheme manager " + managerID.String())
 				sessionHandler.KeyshareError(&managerID, err)
-				return nil, false
+				return nil, false, nil
 			}
 		}
 	}
 	if _, issuing := session.(*irma.IssuanceRequest); issuing && ksscount > 1 {
 		err := errors.New("Issuance session involving more than one keyshare servers are not supported")
 		sessionHandler.KeyshareError(nil, err)
-		return nil, false
+		return nil, false, nil
 	}
 
 	ks := &keyshareSession{
@@ -149,7 +153,7 @@ func newKeyshareSession(
 			continue
 		}
 
-		ks.keyshareServer = ks.client.keyshareServers[managerID]
+		ks.keyshareServer = keyshareServers[managerID]
 		transport := irma.NewHTTPTransport(scheme.KeyshareServer, !ks.client.Preferences.DeveloperMode)
 		transport.SetHeader(kssUsernameHeader, ks.keyshareServer.Username)
 		transport.SetHeader(kssAuthHeader, ks.keyshareServer.token)
@@ -162,13 +166,13 @@ func newKeyshareSession(
 	}
 
 	if !ks.pinCheck {
-		return ks, true
+		return ks, true, nil
 	}
 
 	ks.sessionHandler.KeysharePin()
 	authenticated := make(chan bool, 1)
 	ks.VerifyPin(-1, authenticated)
-	return ks, <-authenticated
+	return ks, <-authenticated, nil
 }
 
 func (kss *keyshareServer) tokenValid(conf *irma.Configuration) bool {

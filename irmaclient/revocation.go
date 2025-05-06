@@ -15,9 +15,13 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
-func (client *Client) initRevocation() {
+func (client *Client) initRevocation() error {
 	// For every credential supporting revocation, compute nonrevocation caches in async jobs
-	for id, attrsets := range client.attributes {
+	attributes, err := client.storage.LoadAttributes()
+	if err != nil {
+		return err
+	}
+	for id, attrsets := range attributes {
 		for i, attrs := range attrsets {
 			if attrs.CredentialType() == nil || !attrs.CredentialType().RevocationSupported() {
 				continue
@@ -41,10 +45,10 @@ func (client *Client) initRevocation() {
 	// increases over time since the last update.
 	// We set the task from starting one second from now to avoid it from running simultaneously
 	// with the job above, because there is no sense in running these simultaneously.
-	_, err := client.Configuration.Scheduler.
+	_, err = client.Configuration.Scheduler.
 		Every(irma.RevocationParameters.ClientUpdateInterval).Seconds().
 		StartAt(time.Now().Add(time.Second)).Do(func() {
-		for id, attrsets := range client.attributes {
+		for id, attrsets := range attributes {
 			for i, attrs := range attrsets {
 				if attrs.CredentialType() == nil || !attrs.CredentialType().RevocationSupported() {
 					continue
@@ -86,6 +90,7 @@ func (client *Client) initRevocation() {
 	if err != nil {
 		client.reportError(err)
 	}
+	return nil
 }
 
 // NonrevPrepare updates the revocation state for each credential in the request
@@ -220,7 +225,11 @@ func (client *Client) nonrevApplyUpdates(id irma.CredentialTypeIdentifier, count
 		}(cred)
 	}
 	if save {
-		if err := client.storage.StoreAttributes(id, client.attributes[id]); err != nil {
+		attributes, err := client.storage.LoadAttributes()
+		if err != nil {
+			return err
+		}
+		if err := client.storage.StoreAttributes(id, attributes[id]); err != nil {
 			client.reportError(err)
 			return err
 		}

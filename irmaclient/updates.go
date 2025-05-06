@@ -64,17 +64,18 @@ var clientUpdates = []func(client *Client) error{
 func (client *Client) update() error {
 	// Load and parse file containing info about already performed updates
 	var err error
-	if client.updates, err = client.storage.LoadUpdates(); err != nil {
+	updates, err := client.storage.LoadUpdates()
+	if err != nil {
 		return err
 	}
 
 	// Early exit if all updates are already performed to prevent superfluously storing the updates array
-	if len(client.updates) == len(clientUpdates) {
+	if len(updates) == len(clientUpdates) {
 		return nil
 	}
 
 	// Perform all new updates
-	for i := len(client.updates); i < len(clientUpdates); i++ {
+	for i := len(updates); i < len(clientUpdates); i++ {
 		err = nil
 		if clientUpdates[i] != nil {
 			err = clientUpdates[i](client)
@@ -88,13 +89,13 @@ func (client *Client) update() error {
 			str := err.Error()
 			u.Error = &str
 		}
-		client.updates = append(client.updates, u)
+		updates = append(updates, u)
 		if err != nil {
 			break
 		}
 	}
 
-	storeErr := client.storage.StoreUpdates(client.updates)
+	storeErr := client.storage.StoreUpdates(updates)
 	if storeErr != nil {
 		return storeErr
 	}

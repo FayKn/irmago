@@ -493,7 +493,7 @@ func (session *session) doSession(proceed bool, choice *irma.DisclosureChoice) {
 		session.finish(false)
 	} else {
 		var err error
-		keyshareSession, auth := newKeyshareSession(
+		keyshareSession, auth, err := newKeyshareSession(
 			session,
 			session.client,
 			session.Handler,
@@ -501,6 +501,12 @@ func (session *session) doSession(proceed bool, choice *irma.DisclosureChoice) {
 			session.implicitDisclosure,
 			session.Version,
 		)
+
+		if err != nil {
+			session.fail(&irma.SessionError{ErrorType: irma.ErrorCrypto, Err: err})
+			return
+		}
+
 		if !auth {
 			// newKeyshareSession() calls session.fail() in case of failure, no need to do that here
 			return
@@ -638,9 +644,13 @@ func (session *session) getProof() (interface{}, error) {
 // checkKeyshareEnrollment checks if we are enrolled into all involved keyshare servers,
 // and aborts the session if not
 func (session *session) checkKeyshareEnrollment() bool {
+	keyshareServers, err := session.client.storage.LoadKeyshareServers()
+	if err != nil {
+		return false
+	}
 	for id := range session.request.Identifiers().SchemeManagers {
 		distributed := session.client.Configuration.SchemeManagers[id].Distributed()
-		_, enrolled := session.client.keyshareServers[id]
+		_, enrolled := keyshareServers[id]
 		if distributed && !enrolled {
 			session.finish(false)
 			session.Handler.KeyshareEnrollmentMissing(id)
