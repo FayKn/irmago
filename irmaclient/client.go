@@ -510,11 +510,13 @@ func (client *Client) GetPreferences() Preferences {
 // TODO: consider if we should save irmamobile preferences here, because they would automatically
 // be part of any backup and syncing solution we implement at a later time
 type Preferences struct {
-	DeveloperMode bool
+	DeveloperMode        bool
+	ExperimentalFeatures bool
 }
 
 var defaultPreferences = Preferences{
-	DeveloperMode: false,
+	DeveloperMode:        false,
+	ExperimentalFeatures: false,
 }
 
 // KeyshareHandler is used for asking the user for his email address and PIN,
