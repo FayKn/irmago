@@ -113,8 +113,8 @@ func CreateTestVerificationContext() SdJwtVcVerificationContext {
 	im.AddCert(irmaAppCertChain[1])
 
 	return SdJwtVcVerificationContext{
-		VerificationContext: eudi_jwt.VerificationContext{
-			X509VerificationOptionsTemplate: x509.VerifyOptions{
+		VerificationContext: &eudi_jwt.StaticVerificationContext{
+			VerifyOpts: x509.VerifyOptions{
 				Roots:         roots,
 				Intermediates: im,
 				KeyUsages:     []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
@@ -192,8 +192,8 @@ func newWorkingVerifyOptions(trustedChains ...[]byte) x509.VerifyOptions {
 
 func newWorkingSdJwtTestConfig() testSdJwtVcConfig {
 	disclosures, err := MultipleNewDisclosureContents(map[string]string{
-		"name":     "Yivi",
-		"location": "Utrecht",
+		"email":  "test@gmail.com",
+		"domain": "gmail.com",
 	})
 	if err != nil {
 		log.Fatalf("failed to create disclosures: %v", err)
@@ -212,7 +212,7 @@ func newWorkingSdJwtTestConfig() testSdJwtVcConfig {
 	return newEmptyTestConfig().
 		withHolderPrivateKey(holderKey).
 		withIssuerPrivateKey(issuerKey).
-		withVct("pbdf.sidn-pbdf.email").
+		withVct("test.test.email").
 		withIssuerUrl("https://openid4vc.staging.yivi.app", false).
 		withIssuedAt(1745394126).
 		withExpiryTime(1945394126).

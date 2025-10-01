@@ -1,18 +1,19 @@
 package irmaclient
 
 import (
-	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"path/filepath"
 	"slices"
+	"sort"
 	"strings"
 	"time"
+
+	"github.com/go-co-op/gocron/v2"
 
 	irma "github.com/privacybydesign/irmago"
 	"github.com/privacybydesign/irmago/eudi"
 	"github.com/privacybydesign/irmago/eudi/credentials/sdjwtvc"
-	eudi_jwt "github.com/privacybydesign/irmago/eudi/jwt"
 	"github.com/privacybydesign/irmago/internal/common"
 )
 
@@ -22,6 +23,7 @@ type Client struct {
 	irmaClient      *IrmaClient
 	logsStorage     LogsStorage
 	keyBinder       sdjwtvc.KeyBinder
+	scheduler       gocron.Scheduler
 }
 
 func New(
@@ -53,6 +55,7 @@ func New(
 		return nil, fmt.Errorf("instantiating configuration failed: %v", err)
 	}
 
+	eudi.Logger = irma.Logger
 	eudiConf, err := eudi.NewConfiguration(eudiConfigurationPath)
 	if err != nil {
 		return nil, fmt.Errorf("instantiating eudi configuration failed: %v", err)
@@ -66,15 +69,11 @@ func New(
 		return nil, fmt.Errorf("failed to open irma storage: %v", err)
 	}
 
-	keybindingStorage := NewBboltKeybindingStorage(storage.db, aesKey)
-	keyBinder := sdjwtvc.NewDefaultKeyBinder(keybindingStorage)
+	keyBindingStorage := NewBboltKeyBindingStorage(storage.db, aesKey)
+	keyBinder := sdjwtvc.NewDefaultKeyBinder(keyBindingStorage)
 
-	verifierVerificationContext := eudi_jwt.VerificationContext{
-		X509VerificationOptionsTemplate: eudiConf.Verifiers.CreateVerifyOptionsTemplate(),
-		X509RevocationLists:             eudiConf.Verifiers.GetRevocationLists(),
-	}
-
-	verifierValidator := eudi.NewRequestorCertificateStoreVerifierValidator(&verifierVerificationContext, &eudi.DefaultQueryValidatorFactory{})
+	// Verifier verification checks if the verifier is trusted
+	verifierValidator := eudi.NewRequestorCertificateStoreVerifierValidator(&eudiConf.Verifiers, &eudi.DefaultQueryValidatorFactory{})
 	sdjwtvcStorage := NewBboltSdJwtVcStorage(storage.db, aesKey)
 
 	openid4vpClient, err := NewOpenID4VPClient(eudiConf, sdjwtvcStorage, verifierValidator, keyBinder, storage)
@@ -82,19 +81,33 @@ func New(
 		return nil, fmt.Errorf("failed to instantiate new openid4vp client: %v", err)
 	}
 
+	// SD-JWT verification checks if the SD-JWT (and the issuing party) can be trusted
 	sdJwtVcVerificationContext := sdjwtvc.SdJwtVcVerificationContext{
-		VerificationContext: eudi_jwt.VerificationContext{
-			X509VerificationOptionsTemplate: eudiConf.Issuers.CreateVerifyOptionsTemplate(),
-			X509RevocationLists:             eudiConf.Issuers.GetRevocationLists(),
-		},
-		Clock:       sdjwtvc.NewSystemClock(),
-		JwtVerifier: sdjwtvc.NewJwxJwtVerifier(),
+		VerificationContext: &eudiConf.Issuers,
+		Clock:               sdjwtvc.NewSystemClock(),
+		JwtVerifier:         sdjwtvc.NewJwxJwtVerifier(),
 	}
 
 	irmaClient, err := NewIrmaClient(irmaConf, handler, signer, storage, sdJwtVcVerificationContext, sdjwtvcStorage, keyBinder)
 	if err != nil {
 		return nil, fmt.Errorf("failed to instantiate irma client: %v", err)
 	}
+
+	// When developer mode is enabled we want to load the staging trust anchors in addition
+	// to the production trust anchors
+	if irmaClient.Preferences.DeveloperMode {
+		openid4vpClient.eudiConf.EnableStagingTrustAnchors()
+	}
+
+	if err := openid4vpClient.eudiConf.Reload(); err != nil {
+		return nil, fmt.Errorf("reloading eudi configuration failed: %v", err)
+	}
+
+	scheduler, err := gocron.NewScheduler()
+	if err != nil {
+		return nil, fmt.Errorf("failed to instantiate new scheduler: %v", err)
+	}
+	scheduler.Start()
 
 	// When IRMA issuance sessions are done, an inprogress OpenID4VP session
 	// should again ask for verification permission,
@@ -107,10 +120,12 @@ func New(
 		irmaClient:      irmaClient,
 		logsStorage:     storage,
 		keyBinder:       keyBinder,
+		scheduler:       scheduler,
 	}, nil
 }
 
 func (client *Client) Close() error {
+	client.scheduler.Shutdown()
 	return client.irmaClient.Close()
 }
 
@@ -128,7 +143,7 @@ func (client *Client) NewSession(sessionrequest string, handler Handler) Session
 		return nil
 	}
 
-	if sessionReq.Protocol == "openid4vp" {
+	if sessionReq.Protocol == Protocol_OpenID4VP {
 		return client.openid4vpClient.NewSession(sessionReq.URL, handler)
 	}
 
@@ -203,23 +218,37 @@ func (client *Client) KeyshareEnroll(manager irma.SchemeManagerIdentifier, email
 	client.irmaClient.KeyshareEnroll(manager, email, pin, lang)
 }
 
-func hashAttributesAndCredType(info *irma.CredentialInfo) string {
-	toHash := info.Identifier().String()
-	for attrType, attrValue := range info.Attributes {
-		toHash += attrType.String() + attrValue[""]
+func hashAttributesAndCredType(info *irma.CredentialInfo) (string, error) {
+	hashContent := info.Identifier().String()
+
+	sortedKeys := []string{}
+	for key := range info.Attributes {
+		sortedKeys = append(sortedKeys, key.String())
 	}
-	hashBytes := sha256.Sum256([]byte(toHash))
-	return string(hashBytes[:])
+	sort.Strings(sortedKeys)
+
+	for _, key := range sortedKeys {
+		valueStr, err := json.Marshal(info.Attributes[irma.NewAttributeTypeIdentifier(key)])
+		if err != nil {
+			return "", err
+		}
+		hashContent += key + string(valueStr)
+	}
+
+	return sdjwtvc.CreateHash(sdjwtvc.HashAlg_Sha256, hashContent)
 }
 
-func sameCredentialAndAttributesCombi(creds []*irma.CredentialInfo) bool {
+func sameCredentialAndAttributesCombi(creds []*irma.CredentialInfo) (bool, error) {
 	typeAndAttrsHashes := map[string]struct{}{}
 
 	for _, c := range creds {
-		hash := hashAttributesAndCredType(c)
+		hash, err := hashAttributesAndCredType(c)
+		if err != nil {
+			return false, err
+		}
 		typeAndAttrsHashes[hash] = struct{}{}
 	}
-	return len(typeAndAttrsHashes) == 1
+	return len(typeAndAttrsHashes) == 1, nil
 }
 
 func (client *Client) RemoveCredentialsByHash(hashByFormat map[CredentialFormat]string) error {
@@ -235,8 +264,12 @@ func (client *Client) RemoveCredentialsByHash(hashByFormat map[CredentialFormat]
 		return fmt.Errorf("trying to delete credential that doesn't exist")
 	}
 
-	if !sameCredentialAndAttributesCombi(relevantCreds) {
-		return fmt.Errorf("deleting two different credential instances at once is not supported")
+	if same, err := sameCredentialAndAttributesCombi(relevantCreds); !same || err != nil {
+		if !same {
+			return fmt.Errorf("deleting two different credential instances at once is not supported")
+		} else {
+			return fmt.Errorf("error while comparing credential attributes: %v", err)
+		}
 	}
 
 	formats := []CredentialFormat{}
@@ -331,7 +364,21 @@ func (client *Client) LoadLogsBefore(beforeIndex uint64, max int) ([]LogInfo, er
 }
 
 func (client *Client) rawLogEntryToLogInfo(entry *LogEntry) (LogInfo, error) {
+	// NOTE: iOS builds change the container ID of the app, meaning that after every compilation/app update the location
+	// of all app data changes. Logs store an absolute path to requestor logo's, which becomes invalid when the data is moved,
+	// resulting in the logo's not being found for existing logs when an iOS app is updated.
+	// Solving this issue correctly would require a deep refactor of many components and would likely introduce some very obscure bugs.
+	// This hacky solution works around the issue by assuming the image path to be invalid and resolving it based on other information:
+	//  - For OpenID4VP sessions the logo path is resolved based on the image name
+	//  - For IRMA sessions the logo path is resolved based on the requestor ID and using the requestor schemes
 	if entry.OpenID4VP != nil {
+		requestor := entry.ServerName
+		if requestor != nil && requestor.Logo != nil {
+			path, err := client.openid4vpClient.eudiConf.ResolveVerifierLogoPath(*entry.ServerName.Logo)
+			if err == nil {
+				requestor.LogoPath = &path
+			}
+		}
 		return LogInfo{
 			ID:   entry.ID,
 			Type: LogType_Disclosure,
@@ -339,9 +386,19 @@ func (client *Client) rawLogEntryToLogInfo(entry *LogEntry) (LogInfo, error) {
 			DisclosureLog: &DisclosureLog{
 				Protocol:    Protocol_OpenID4VP,
 				Credentials: entry.OpenID4VP.DisclosedCredentials,
-				Verifier:    entry.ServerName,
+				Verifier:    requestor,
 			},
 		}, nil
+	}
+
+	// resolve the image for an irma session
+	requestor := entry.ServerName
+	if requestor != nil && requestor.Logo != nil {
+		requestorScheme, ok := client.GetIrmaConfiguration().RequestorSchemes[requestor.ID.RequestorSchemeIdentifier()]
+		if ok && requestorScheme != nil {
+			path := requestor.ResolveLogoPath(requestorScheme)
+			requestor.LogoPath = &path
+		}
 	}
 
 	switch entry.Type {
@@ -357,7 +414,7 @@ func (client *Client) rawLogEntryToLogInfo(entry *LogEntry) (LogInfo, error) {
 		disclosureLog := &DisclosureLog{
 			Protocol:    Protocol_Irma,
 			Credentials: credLog,
-			Verifier:    entry.ServerName,
+			Verifier:    requestor,
 		}
 
 		if entry.Type == irma.ActionSigning {
@@ -402,7 +459,7 @@ func (client *Client) rawLogEntryToLogInfo(entry *LogEntry) (LogInfo, error) {
 				Protocol:             Protocol_Irma,
 				Credentials:          issuedLog,
 				DisclosedCredentials: credLog,
-				Issuer:               entry.ServerName,
+				Issuer:               requestor,
 			},
 		}, nil
 	case ActionRemoval:
@@ -500,10 +557,33 @@ func (client *Client) rawLogEntriesToLogInfo(entries []*LogEntry) ([]LogInfo, er
 
 func (client *Client) SetPreferences(prefs Preferences) {
 	client.irmaClient.SetPreferences(prefs)
+	if prefs.DeveloperMode {
+		client.openid4vpClient.eudiConf.EnableStagingTrustAnchors()
+
+		if err := client.openid4vpClient.eudiConf.Reload(); err != nil {
+			common.Logger.Warnf("error while reloading eudi config: %v", err)
+		}
+		if err := client.openid4vpClient.eudiConf.UpdateCertificateRevocationLists(); err != nil {
+			common.Logger.Warnf("error while updating CRLs: %v", err)
+		}
+	}
 }
 
 func (client *Client) GetPreferences() Preferences {
 	return client.irmaClient.Preferences
+}
+
+func (client *Client) InitJobs(eudiRevocationListUpdateInterval time.Duration) {
+	// Future TODO: add Context so we can check for cancellation of the job ?
+	_, err := client.scheduler.NewJob(
+		gocron.DurationJob(eudiRevocationListUpdateInterval),
+		gocron.NewTask(client.openid4vpClient.eudiConf.UpdateCertificateRevocationLists),
+		gocron.WithStartAt(gocron.WithStartImmediately()),
+	)
+
+	if err != nil {
+		common.Logger.Warnf("failed to create new cron job for updating CLRs: %v", err)
+	}
 }
 
 // Preferences contains the preferences of the user of this client.

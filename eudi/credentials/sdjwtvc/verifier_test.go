@@ -53,18 +53,18 @@ import (
 // =======================================================================
 
 type x509TestConfig struct {
-	IssuerCertChain   []byte
-	VerifierCertChain []byte
-	IssUrl            string
-	ShouldFail        bool
+	IssuerCert                     []byte
+	VerifierTrustedIssuerCertChain []byte
+	IssUrl                         string
+	ShouldFail                     bool
 }
 
 func runCertChainTest(t *testing.T, config x509TestConfig) {
-	chain, err := utils.ParsePemCertificateChainToX5cFormat(config.IssuerCertChain)
+	chain, err := utils.ParsePemCertificateChainToX5cFormat(config.IssuerCert)
 	require.NoError(t, err)
 
 	disclosures, err := MultipleNewDisclosureContents(map[string]string{
-		"email": "test@mail.com",
+		"email": "test@gmail.com",
 	})
 	require.NoError(t, err)
 
@@ -73,18 +73,18 @@ func runCertChainTest(t *testing.T, config x509TestConfig) {
 		WithExpiresAt(time.Now().Unix()).
 		WithIssuerCertificateChain(chain).
 		WithIssuerUrl(config.IssUrl).
-		WithVerifiableCredentialType("pbdf.sidn-pbdf.email").
+		WithVerifiableCredentialType("test.test.email").
 		WithDisclosures(disclosures).
 		WithHashingAlgorithm(HashAlg_Sha256).
 		Build(creator)
 	require.NoError(t, err)
 
-	verifyOpts, err := utils.CreateX509VerifyOptionsFromCertChain(config.VerifierCertChain)
+	verifyOpts, err := utils.CreateX509VerifyOptionsFromCertChain(config.VerifierTrustedIssuerCertChain)
 	require.NoError(t, err)
 
 	context := SdJwtVcVerificationContext{
-		VerificationContext: eudi_jwt.VerificationContext{
-			X509VerificationOptionsTemplate: *verifyOpts,
+		VerificationContext: &eudi_jwt.StaticVerificationContext{
+			VerifyOpts: *verifyOpts,
 		},
 		Clock:       NewSystemClock(),
 		JwtVerifier: NewJwxJwtVerifier(),
@@ -100,37 +100,27 @@ func runCertChainTest(t *testing.T, config x509TestConfig) {
 
 func Test_ValidLeafCertOnly_Success(t *testing.T) {
 	runCertChainTest(t, x509TestConfig{
-		IssuerCertChain:   testdata.IssuerCert_irma_app_Bytes,
-		VerifierCertChain: testdata.IssuerCertChain_irma_app_Bytes,
-		IssUrl:            "https://irma.app",
-		ShouldFail:        false,
+		IssuerCert:                     testdata.IssuerCert_irma_app_Bytes,
+		VerifierTrustedIssuerCertChain: testdata.IssuerCert_irma_app_Bytes,
+		IssUrl:                         "https://irma.app",
+		ShouldFail:                     false,
 	})
 }
 
 func Test_Valid_X509Chain_Success(t *testing.T) {
 	runCertChainTest(t, x509TestConfig{
-		IssuerCertChain:   testdata.IssuerCertChain_irma_app_Bytes,
-		VerifierCertChain: testdata.IssuerCertChain_irma_app_Bytes,
-		IssUrl:            "https://irma.app",
-		ShouldFail:        false,
-	})
-}
-
-func Test_Valid_SelfSigned_X509Cert_Success(t *testing.T) {
-	runCertChainTest(t, x509TestConfig{
-		IssuerCertChain:   testdata.IssuerCert_irma_app_Bytes,
-		VerifierCertChain: testdata.IssuerCert_irma_app_Bytes,
-		IssUrl:            "https://irma.app",
-		ShouldFail:        false,
+		IssuerCert:                     testdata.IssuerCert_irma_app_Bytes,
+		VerifierTrustedIssuerCertChain: testdata.IssuerCertChain_irma_app_Bytes,
+		IssUrl:                         "https://irma.app",
+		ShouldFail:                     false,
 	})
 }
 
 func Test_ValidButUntrusted_SelfSigned_X509Cert_Fails(t *testing.T) {
 	runCertChainTest(t, x509TestConfig{
-		IssuerCertChain:   testdata.IssuerCert_irma_app_Bytes,
-		VerifierCertChain: testdata.IssuerCert_openid4vc_staging_yivi_app_Bytes,
-		IssUrl:            "https://irma.app",
-		ShouldFail:        true,
+		IssuerCert: testdata.IssuerCert_irma_app_Bytes,
+		IssUrl:     "https://irma.app",
+		ShouldFail: true,
 	})
 }
 
@@ -391,8 +381,8 @@ func Test_VerificationIsBeforeNotBefore_Fails(t *testing.T) {
 		withNotBefore(nbf)
 
 	context := SdJwtVcVerificationContext{
-		VerificationContext: eudi_jwt.VerificationContext{
-			X509VerificationOptionsTemplate: newWorkingVerifyOptions(),
+		VerificationContext: &eudi_jwt.StaticVerificationContext{
+			VerifyOpts: newWorkingVerifyOptions(),
 		},
 		Clock:       &testClock{time: now},
 		JwtVerifier: NewJwxJwtVerifier(),
@@ -412,8 +402,8 @@ func Test_VerificationMinusOneMinuteIsBeforeIat_GivenClockSkew_Success(t *testin
 		withKbIssuedAt(now)
 
 	context := SdJwtVcVerificationContext{
-		VerificationContext: eudi_jwt.VerificationContext{
-			X509VerificationOptionsTemplate: newWorkingVerifyOptions(testdata.IssuerCert_openid4vc_staging_yivi_app_Bytes),
+		VerificationContext: &eudi_jwt.StaticVerificationContext{
+			VerifyOpts: newWorkingVerifyOptions(testdata.IssuerCert_openid4vc_staging_yivi_app_Bytes),
 		},
 		Clock:       &testClock{time: now - 60},
 		JwtVerifier: NewJwxJwtVerifier(),
@@ -434,8 +424,8 @@ func Test_VerificationPlusOneMinuteIsAfterExp_GivenClockSkew_Success(t *testing.
 		withExpiryTime(now)
 
 	context := SdJwtVcVerificationContext{
-		VerificationContext: eudi_jwt.VerificationContext{
-			X509VerificationOptionsTemplate: newWorkingVerifyOptions(testdata.IssuerCert_openid4vc_staging_yivi_app_Bytes),
+		VerificationContext: &eudi_jwt.StaticVerificationContext{
+			VerifyOpts: newWorkingVerifyOptions(testdata.IssuerCert_openid4vc_staging_yivi_app_Bytes),
 		},
 		Clock:       &testClock{time: now + 60},
 		JwtVerifier: NewJwxJwtVerifier(),
@@ -456,8 +446,8 @@ func Test_VerificationMinusOneMinuteIsBeforeNotBefore_GivenClockSkew_Success(t *
 		withNotBefore(now)
 
 	context := SdJwtVcVerificationContext{
-		VerificationContext: eudi_jwt.VerificationContext{
-			X509VerificationOptionsTemplate: newWorkingVerifyOptions(testdata.IssuerCert_openid4vc_staging_yivi_app_Bytes),
+		VerificationContext: &eudi_jwt.StaticVerificationContext{
+			VerifyOpts: newWorkingVerifyOptions(testdata.IssuerCert_openid4vc_staging_yivi_app_Bytes),
 		},
 		Clock:       &testClock{time: now - 60},
 		JwtVerifier: NewJwxJwtVerifier(),
